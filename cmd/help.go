@@ -24,10 +24,12 @@ func PrintTopHelp() {
                               Reconcile unmatched bank lines on a journal
   %sjournals%s <id> unreconcile --account <code|id> [--yes]
                               Unlink every reconciliation on a journal+account
+  %saccounts%s [--search KW]      List every GL account from the cache
+  %saccounts%s <code|id>          List move-lines on an account (JSONL when piped)
   %saccounts%s move <from> <to> [--yes]
-                              Reassign every move-line from one account to another
-  %saccount%s <code> [--jsonl|--json]
-                              List move-lines on an account (JSONL when piped)
+                              Bulk reassign every line on <from> to <to>
+  %sreconcile%s --account <code> [-i] [--yes]
+                              Pair debits/credits on an account (same-account reconcile)
   %sattach%s <invoice-ref> [--yes]
                               Pipe JSONL → batch-reconcile lines onto an invoice
   %sassign%s <to-code> [--yes]    Pipe JSONL → reassign lines to a different account
@@ -35,6 +37,7 @@ func PrintTopHelp() {
   %spull%s                        Refresh local cache from Odoo (favorites + invoices + bills)
   %spush%s [--yes]                Apply pending local changes to Odoo
   %ssync%s [--yes]                pull + push
+  %supdate%s [--check] [--yes]    Self-update from GitHub releases
 
 %sGLOBAL FLAGS%s
   %s--db%s <name>                 Override the active database for this invocation
@@ -79,6 +82,9 @@ func PrintTopHelp() {
 		f.Cyan, f.Reset,
 		f.Cyan, f.Reset,
 		f.Cyan, f.Reset,
+		f.Cyan, f.Reset,
+		f.Cyan, f.Reset,
+		f.Cyan, f.Reset, // update
 		f.Bold, f.Reset,
 		f.Yellow, f.Reset,
 		f.Yellow, f.Reset, f.Yellow, f.Reset,

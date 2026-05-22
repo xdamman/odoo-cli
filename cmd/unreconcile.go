@@ -153,9 +153,20 @@ func UnreconcileFromStdin(args []string) error {
 			Fmt.Dim, Fmt.Reset)
 		return nil
 	}
-	if dryRun || !assumeYes {
+	if dryRun {
 		fmt.Printf("%s(dry-run — re-run with --yes to apply.)%s\n\n", Fmt.Dim, Fmt.Reset)
 		return nil
+	}
+	if !assumeYes {
+		ok, terr := confirmTTY(fmt.Sprintf("Unlink %d partial-reconcile record%s on %s?",
+			len(partials), pluralS(len(partials)), db.Host()))
+		if terr != nil {
+			return fmt.Errorf("no controlling terminal for confirmation (%v) — re-run with --yes", terr)
+		}
+		if !ok {
+			fmt.Println("  cancelled.")
+			return nil
+		}
 	}
 
 	partialIDs := make([]interface{}, 0, len(partials))

@@ -60,6 +60,7 @@ func Attach(args []string) error {
 	assumeYes := HasFlag(args, "--yes", "-y")
 	dryRun := HasFlag(args, "--dry-run")
 	verbose := HasFlag(args, "-v", "--verbose")
+	force := HasFlag(args, "--force", "-f")
 	if dryRun {
 		assumeYes = false
 	}
@@ -93,9 +94,11 @@ func Attach(args []string) error {
 	}
 
 	// Resolve each tx to a statement line. Skip-with-warning on
-	// missing uniqueImportId/statementLineId, unknown line, or
-	// already-reconciled — the caller can re-run after fixing.
+	// missing uniqueImportId/statementLineId or unknown line.
+	// Already-reconciled lines are skipped by default, but --force
+	// collects them so we can unreconcile-and-reattach in one pass.
 	lines := make([]JournalLine, 0, len(txs))
+	forcedLines := make([]JournalLine, 0)
 	var skipped int
 	for i, tx := range txs {
 		desc := FirstNonEmpty(tx.DisplayDescription, tx.UniqueImportID,
@@ -125,10 +128,13 @@ func Attach(args []string) error {
 			continue
 		}
 		if ln.IsReconciled {
-			fmt.Printf("  %s⚠ %s: bank line #%d already reconciled — skipped (run `odoo journals %d unreconcile --account <code>` first, or pipe through `odoo unreconcile`)%s\n",
-				Fmt.Yellow, desc, ln.ID, ln.JournalID, Fmt.Reset)
-			skipped++
-			continue
+			if !force {
+				fmt.Printf("  %s⚠ %s: bank line #%d already reconciled — skipped (re-run with --force to unreconcile + reattach, or unreconcile first)%s\n",
+					Fmt.Yellow, desc, ln.ID, Fmt.Reset)
+				skipped++
+				continue
+			}
+			forcedLines = append(forcedLines, ln)
 		}
 		lines = append(lines, ln)
 	}
@@ -166,11 +172,38 @@ func Attach(args []string) error {
 	if skipped > 0 {
 		fmt.Printf("  %s%d tx skipped (see warnings above)%s\n", Fmt.Yellow, skipped, Fmt.Reset)
 	}
+	if len(forcedLines) > 0 {
+		fmt.Printf("  %s↻ %d line%s already reconciled — will unreconcile + reattach (--force)%s\n",
+			Fmt.Yellow, len(forcedLines), pluralS(len(forcedLines)), Fmt.Reset)
+	}
 	fmt.Println()
 
-	if dryRun || !assumeYes {
+	if dryRun {
 		fmt.Printf("%s(dry-run — re-run with --yes to apply.)%s\n\n", Fmt.Dim, Fmt.Reset)
 		return nil
+	}
+	if !assumeYes {
+		ok, terr := confirmTTY(fmt.Sprintf("Attach %d line%s to %s on %s?",
+			len(lines), pluralS(len(lines)), invoice.Name, db.Host()))
+		if terr != nil {
+			return fmt.Errorf("no controlling terminal for confirmation (%v) — re-run with --yes", terr)
+		}
+		if !ok {
+			fmt.Println("  cancelled.")
+			return nil
+		}
+	}
+
+	// --force pre-pass: unreconcile each already-reconciled line so
+	// AttachLinesToInvoice's draft → rewrite → reconcile dance has
+	// clean counterparts to work with.
+	for _, fl := range forcedLines {
+		n, err := unreconcileForReattach(db, uid, fl)
+		if err != nil {
+			return fmt.Errorf("force-unreconcile line #%d: %v", fl.ID, err)
+		}
+		fmt.Printf("  %s↻%s unreconciled %d partial%s on line #%d\n",
+			Fmt.Yellow, Fmt.Reset, n, pluralS(n), fl.ID)
 	}
 
 	if err := AttachLinesToInvoice(db, uid, lines, *invoice); err != nil {
@@ -275,6 +308,53 @@ func findStatementLineByID(db *Database, uid, id int) (JournalLine, bool, error)
 		[]interface{}{[]interface{}{"id", "=", id}})
 }
 
+// unreconcileForReattach undoes the existing reconciliation on a
+// bank statement line so AttachLinesToInvoice can re-attach it to a
+// different invoice. Finds the move's non-bank counterpart (the
+// line that's currently sitting on the OLD A/R/A/P account), reads
+// its matched_debit_ids + matched_credit_ids, and unlinks every
+// partial.reconcile pairing it. Returns the number of partials
+// removed (0 = the line wasn't actually reconciled).
+func unreconcileForReattach(db *Database, uid int, line JournalLine) (int, error) {
+	counterpartID, err := findStatementCounterpartLine(db, uid, line)
+	if err != nil {
+		return 0, fmt.Errorf("find counterpart: %v", err)
+	}
+	if counterpartID == 0 {
+		return 0, fmt.Errorf("could not identify counterpart on move #%d", line.MoveID)
+	}
+	rows, err := SearchReadAllMaps(db, uid, "account.move.line",
+		[]interface{}{[]interface{}{"id", "=", counterpartID}},
+		[]string{"matched_debit_ids", "matched_credit_ids"},
+		"",
+	)
+	if err != nil {
+		return 0, fmt.Errorf("read counterpart: %v", err)
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	partials := make([]interface{}, 0)
+	for _, key := range []string{"matched_debit_ids", "matched_credit_ids"} {
+		if arr, ok := rows[0][key].([]interface{}); ok {
+			for _, v := range arr {
+				if id := Int(v); id > 0 {
+					partials = append(partials, id)
+				}
+			}
+		}
+	}
+	if len(partials) == 0 {
+		return 0, nil
+	}
+	if _, err := Exec(db.URL, db.DB, uid, db.Password,
+		"account.partial.reconcile", "unlink",
+		[]interface{}{partials}, nil); err != nil {
+		return 0, err
+	}
+	return len(partials), nil
+}
+
 func findStatementLineWhere(db *Database, uid int, domain []interface{}) (JournalLine, bool, error) {
 	rows, err := SearchReadAllMaps(db, uid, "account.bank.statement.line",
 		domain,
@@ -311,6 +391,7 @@ func printAttachHelp() {
 %sUSAGE%s
   %scat tx.jsonl | odoo attach MEM/2026/00036%s              Dry-run preview
   %scat tx.jsonl | odoo attach MEM/2026/00036 --yes%s        Apply
+  %scat tx.jsonl | odoo attach REF --force --yes%s           Auto-unreconcile already-attached lines
   %schb transactions --amount 484 | odoo attach REF --yes%s  Common chb pipe
 
 %sINPUT%s
@@ -340,14 +421,21 @@ func printAttachHelp() {
   Already-paid invoices are handled the same way the TUI does it:
   unreconcile the existing match, then reattach the piped lines.
 
+  %s--force%s extends that to the bank-line side: lines already
+  reconciled with a DIFFERENT invoice are unreconciled (their
+  account.partial.reconcile pairings are unlinked) and re-attached
+  in one pass. Without --force those lines are skipped with a
+  warning.
+
 `,
 		f.Bold, f.Reset,
 		f.Bold, f.Reset,
-		f.Cyan, f.Reset, f.Cyan, f.Reset, f.Cyan, f.Reset,
+		f.Cyan, f.Reset, f.Cyan, f.Reset, f.Cyan, f.Reset, f.Cyan, f.Reset,
 		f.Bold, f.Reset, f.Cyan, f.Reset, f.Cyan, f.Reset, f.Cyan, f.Reset,
 		f.Bold, f.Reset,
 		f.Cyan, f.Reset,
 		f.Cyan, f.Reset,
 		f.Cyan, f.Reset,
+		f.Yellow, f.Reset,
 	)
 }

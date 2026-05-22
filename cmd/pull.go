@@ -80,6 +80,7 @@ type LastSyncFile struct {
 	PulledAt        string `json:"pulledAt,omitempty"`
 	PushedAt        string `json:"pushedAt,omitempty"`
 	JournalsCount   int    `json:"journalsCount,omitempty"`
+	AccountsCount   int    `json:"accountsCount,omitempty"`
 	InvoicesCount   int    `json:"invoicesCount,omitempty"`
 	BillsCount      int    `json:"billsCount,omitempty"`
 	PartnersCount   int    `json:"partnersCount,omitempty"`
@@ -204,7 +205,20 @@ func Pull(args []string) error {
 		}
 	}
 
-	// 3. Open invoices
+	// 3. GL accounts list
+	fmt.Printf("%s● Pulling accounts list …%s\n", Fmt.Dim, Fmt.Reset)
+	accounts, err := FetchAccounts(db, uid)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  %s⚠ accounts: %v%s\n", Fmt.Yellow, err, Fmt.Reset)
+	} else {
+		if err := WriteAccountsCache(db.Name, accounts); err != nil {
+			fmt.Fprintf(os.Stderr, "  %s⚠ write accounts cache: %v%s\n", Fmt.Yellow, err, Fmt.Reset)
+		}
+		sync.AccountsCount = len(accounts)
+		fmt.Printf("  %s✓ %d accounts%s\n", Fmt.Green, len(accounts), Fmt.Reset)
+	}
+
+	// 4. Open invoices
 	fmt.Printf("%s● Pulling open invoices …%s\n", Fmt.Dim, Fmt.Reset)
 	invoices, err := FetchInvoices(db, uid, "out_invoice", "out_refund")
 	if err != nil {

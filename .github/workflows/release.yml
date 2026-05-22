@@ -31,10 +31,13 @@ jobs:
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME}"
           mkdir -p dist
+          # Tarball names are version-agnostic (odoo-<os>-<arch>.tar.gz)
+          # so /releases/latest/download/<name> always resolves. The
+          # version is still embedded in the binary via -X main.VERSION.
           for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
             os="${target%/*}"
             arch="${target#*/}"
-            staging="odoo-${VERSION}-${os}-${arch}"
+            staging="odoo-${os}-${arch}"
             mkdir -p "dist/${staging}"
             GOOS="${os}" GOARCH="${arch}" CGO_ENABLED=0 \
               go build \

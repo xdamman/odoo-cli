@@ -6,12 +6,60 @@ queued changes back to Odoo — without a browser tab.
 
 ## Install
 
-```
-go install github.com/xdamman/odoo@latest
+Prebuilt binaries for linux/macOS × amd64/arm64 are attached to every
+[release](https://github.com/xdamman/odoo-cli/releases). One-liner:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/xdamman/odoo-cli/main/install.sh | sh
 ```
 
-The binary is named `odoo`. Add `$(go env GOPATH)/bin` to your `$PATH`
-if you haven't already.
+That detects your OS + arch, downloads the matching tarball, verifies
+its SHA256 against the release's `checksums.txt`, and drops `odoo`
+into `~/.local/bin`. Re-run any time — it's the supported first-time
+install path. After that, **upgrades are one command:**
+
+```sh
+odoo update
+```
+
+### Customising the install
+
+```sh
+# pin a specific version
+curl -fsSL https://raw.githubusercontent.com/xdamman/odoo-cli/main/install.sh | VERSION=v0.0.1 sh
+
+# install system-wide (binary at /usr/local/bin/odoo)
+curl -fsSL https://raw.githubusercontent.com/xdamman/odoo-cli/main/install.sh | sudo PREFIX=/usr/local sh
+```
+
+Make sure your chosen `$PREFIX/bin` is on your `$PATH`. The installer
+prints a hint if it isn't.
+
+### Manual install
+
+If you'd rather not pipe a script to your shell:
+
+```sh
+VERSION=v0.0.1   # or any tag from https://github.com/xdamman/odoo-cli/releases
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
+curl -fsSL "https://github.com/xdamman/odoo-cli/releases/download/${VERSION}/odoo-${OS}-${ARCH}.tar.gz" \
+  | tar xz -C /tmp
+install -m 0755 "/tmp/odoo-${OS}-${ARCH}/odoo" "$HOME/.local/bin/odoo"
+```
+
+### From source
+
+```sh
+git clone https://github.com/xdamman/odoo-cli && cd odoo-cli
+make build         # ./odoo
+make install       # $HOME/.local/bin/odoo (override PREFIX=...)
+```
+
+> `go install` is not supported — the binary's module path
+> (`github.com/xdamman/odoo`) doesn't match the repo
+> (`github.com/xdamman/odoo-cli`). Use the installer above or
+> `make install` from a clone.
 
 ## Quickstart
 
@@ -78,6 +126,7 @@ db: acme
 | `odoo pull` | Refresh `~/.odoo/cache/<db>/` from Odoo: journals list, favorite-journal lines, open invoices/bills, partner index. Read-only. |
 | `odoo push [--yes]` | Replay queued pending changes against Odoo. Successful changes archive to `sent/`. |
 | `odoo sync [--yes]` | `odoo pull && odoo push`. |
+| `odoo update [--check] [--yes]` | Self-update from the latest GitHub release (SHA256-verified, atomic). |
 
 Every command supports `--help`, which short-circuits at the top of
 the dispatch and returns immediately.

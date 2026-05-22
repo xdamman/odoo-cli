@@ -165,9 +165,20 @@ func Assign(args []string) error {
 	}
 	fmt.Println()
 
-	if dryRun || !assumeYes {
+	if dryRun {
 		fmt.Printf("%s(dry-run — re-run with --yes to apply.)%s\n\n", Fmt.Dim, Fmt.Reset)
 		return nil
+	}
+	if !assumeYes {
+		ok, terr := confirmTTY(fmt.Sprintf("Reassign %d line%s to %s on %s?",
+			totalLines, pluralS(totalLines), dst.Code, db.Host()))
+		if terr != nil {
+			return fmt.Errorf("no controlling terminal for confirmation (%v) — re-run with --yes", terr)
+		}
+		if !ok {
+			fmt.Println("  cancelled.")
+			return nil
+		}
 	}
 
 	var applied, failed int

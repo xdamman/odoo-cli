@@ -39,20 +39,22 @@ func main() {
 		exitOn(cmd.Journals(stripCommand(args, "journals")))
 	case "accounts":
 		exitOn(cmd.Accounts(stripCommand(args, "accounts")))
-	case "account":
-		exitOn(cmd.ListAccount(stripCommand(args, "account")))
 	case "attach":
 		exitOn(cmd.Attach(stripCommand(args, "attach")))
 	case "assign":
 		exitOn(cmd.Assign(stripCommand(args, "assign")))
 	case "unreconcile":
 		exitOn(cmd.UnreconcileFromStdin(stripCommand(args, "unreconcile")))
+	case "reconcile":
+		exitOn(cmd.ReconcileCmd(stripCommand(args, "reconcile")))
 	case "pull":
 		exitOn(cmd.Pull(stripCommand(args, "pull")))
 	case "push":
 		exitOn(cmd.Push(stripCommand(args, "push")))
 	case "sync":
 		exitOn(cmd.Sync(stripCommand(args, "sync")))
+	case "update":
+		exitOn(cmd.Update(stripCommand(args, "update")))
 	default:
 		fmt.Fprintf(os.Stderr, "%sUnknown command: %s%s\n\n", cmd.Fmt.Red, firstNonFlag(args), cmd.Fmt.Reset)
 		cmd.PrintTopHelp()
