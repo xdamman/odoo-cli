@@ -59,6 +59,7 @@ func Assign(args []string) error {
 	dryRun := HasFlag(args, "--dry-run")
 	assumeYes := HasFlag(args, "--yes", "-y")
 	verbose := HasFlag(args, "-v", "--verbose")
+	force := HasFlag(args, "--force")
 	if dryRun {
 		assumeYes = false
 	}
@@ -98,24 +99,47 @@ func Assign(args []string) error {
 		return fmt.Errorf("destination account: %v", err)
 	}
 
-	// Resolve chb-style uniqueImportIds to suspense-side move-line
-	// ids. Skipped silently when stdin had nothing in that bucket.
+	// Resolve chb-style uniqueImportIds to the categorised-side
+	// move-line on each statement's move. Returns BOTH still-open
+	// and already-reconciled statements so we can show the operator
+	// the current account either way.
 	var resolvedIDs []int
 	if len(importIDs) > 0 {
-		fmt.Printf("%s● Resolving %d chb tx%s → bank suspense lines …%s\n",
+		fmt.Printf("%s● Resolving %d chb tx%s → categorised move-lines …%s\n",
 			Fmt.Dim, len(importIDs), pluralS(len(importIDs)), Fmt.Reset)
-		rids, unresolved, alreadyReconciled, rerr := resolveImportIDsToSuspenseLines(db, uid, importIDs)
+		resolutions, unresolved, rerr := resolveImportIDsToCategorisedLines(db, uid, importIDs)
 		if rerr != nil {
 			return rerr
 		}
-		resolvedIDs = rids
-		fmt.Printf("  %sresolved: %d · unresolved: %d · already reconciled: %d%s\n",
-			Fmt.Dim, len(rids), len(unresolved), len(alreadyReconciled), Fmt.Reset)
-		// Surface a handful of unresolved + reconciled rows so the
-		// operator can see what got skipped without scrolling through
-		// every chb id.
+
+		// Account-id → "code (name)" labels for the "currently on …"
+		// detail line on each skip warning.
+		acctIDs := make([]int, 0, len(resolutions))
+		for _, r := range resolutions {
+			acctIDs = append(acctIDs, r.CurrentAccountID)
+		}
+		acctLabels := lookupAccountLabels(db, uid, acctIDs)
+
+		var safe, skippedReconciled, forced []chbResolution
+		for _, r := range resolutions {
+			switch {
+			case r.WasReconciled && !force:
+				skippedReconciled = append(skippedReconciled, r)
+			case r.WasReconciled && force:
+				forced = append(forced, r)
+				safe = append(safe, r)
+				resolvedIDs = append(resolvedIDs, r.MoveLineID)
+			default:
+				safe = append(safe, r)
+				resolvedIDs = append(resolvedIDs, r.MoveLineID)
+			}
+		}
+
+		fmt.Printf("  %sresolved: %d · unresolved: %d · skipped (already reconciled): %d%s\n",
+			Fmt.Dim, len(safe), len(unresolved), len(skippedReconciled), Fmt.Reset)
 		printSkippedImportIDs("not found in Odoo (push or pull first?)", unresolved, importContext)
-		printSkippedImportIDs("already reconciled — nothing to assign", alreadyReconciled, importContext)
+		printSkippedReconciled(skippedReconciled, importContext, acctLabels)
+		printForcedResolutions(forced, importContext, acctLabels)
 	}
 
 	ids := dedupeInts(append(directIDs, resolvedIDs...))
@@ -299,19 +323,31 @@ func printAssignHelp() {
   %schb transactions --search donation --unreconciled | odoo assign 740040%s
   %schb transactions --since 20260101 --unreconciled | odoo assign 740040 --yes%s
 
+  %s# Force-retarget chb txs whose bank line was already categorised%s
+  %schb transactions --search Mohammed | odoo assign 740040 --force%s
+
 %sBEHAVIOUR%s
   Reads JSONL on stdin. Two record shapes accepted:
 
     %s{"id": 12345}%s                  Odoo account.move.line id. Used
                                    as-is (re-assign existing line).
-    %s{"uniqueImportId": "stripe:txn_…"}%s  chb-style bank tx. Resolves to the
-                                   underlying account.bank.statement.line
-                                   then to its suspense-side counterpart
-                                   move-line. THAT line is retargeted.
+    %s{"uniqueImportId": "stripe:txn_…"}%s  chb-style bank tx. Resolves via
+                                   account.bank.statement.line to the
+                                   non-bank-side move-line on that
+                                   statement's move (the categorised
+                                   side — suspense for an unreconciled
+                                   statement, the actual income/expense
+                                   account once it's been categorised).
+                                   THAT line is retargeted to <to-code>.
 
   Records with both fields favour %sid%s. Mixed stdin works. Records
   with neither (or with a chb-style %sid%s that's a string, not an int)
   fall back to %suniqueImportId%s.
+
+  By default chb txs whose bank statement is already reconciled in
+  Odoo are skipped, with a warning that shows the account they're
+  currently booked to. Pass %s--force%s to retarget them anyway — useful
+  when a previous categorisation went to the wrong account.
 
   For each resolved line, groups by parent move, then per move:
     posted   → draft → rewrite account_id → repost
@@ -334,12 +370,15 @@ func printAssignHelp() {
 		f.Cyan, f.Reset, f.Cyan, f.Reset, f.Cyan, f.Reset,
 		f.Dim, f.Reset,
 		f.Cyan, f.Reset, f.Cyan, f.Reset,
+		f.Dim, f.Reset, // # Force-retarget chb txs whose bank line was already categorised
+		f.Cyan, f.Reset, // chb transactions --search Mohammed … --force
 		f.Bold, f.Reset,
 		f.Cyan, f.Reset,
 		f.Cyan, f.Reset,
 		f.Yellow, f.Reset,
 		f.Yellow, f.Reset,
 		f.Yellow, f.Reset,
+		f.Cyan, f.Reset, // --force in the BEHAVIOUR sentence
 		f.Cyan, f.Reset,
 		f.Cyan, f.Reset,
 	)
@@ -421,21 +460,37 @@ func readPipedAssignRecords(r io.Reader) ([]pipedAssignRecord, error) {
 	return out, scanner.Err()
 }
 
-// resolveImportIDsToSuspenseLines walks the chb-style pipeline:
+// chbResolution is one resolved chb tx → Odoo move-line link. The
+// "categorised side" is the non-bank line on the statement's move:
+// for an unreconciled statement that's the suspense line, for an
+// already-reconciled one it's whatever real account the operator
+// previously booked it onto.
+type chbResolution struct {
+	UniqueImportID   string // the chb-side identifier (for context)
+	MoveLineID       int    // account.move.line to retarget
+	CurrentAccountID int    // where the line lives right now
+	WasReconciled    bool   // statement line is_reconciled when we looked
+}
+
+// resolveImportIDsToCategorisedLines walks the chb pipeline:
 //
-//	uniqueImportId → account.bank.statement.line → its journal →
-//	suspense_account_id → that move's account.move.line where
-//	account_id == suspense (the line to retarget).
+//	uniqueImportId → account.bank.statement.line → its journal's
+//	default_account_id (the bank GL) → every NON-bank line on the
+//	statement's move (the categorised side; for an unreconciled
+//	statement that's the suspense line, for a reconciled one it's
+//	the account the operator already booked it onto).
 //
-// Returns the resolved move-line ids, the list of import-ids that
-// couldn't be matched to a statement line at all (likely not yet
-// pushed to Odoo), and the list whose statement line existed but
-// was already reconciled (no suspense line to retarget).
+// Per chb tx the resolver may return more than one resolution
+// (split categorisations). Both the open and already-reconciled
+// statement lines are returned; the caller decides what to do based
+// on WasReconciled and the --force flag.
 //
-// Three RPCs total: statement lines, journals (for
-// suspense_account_id), move-lines. All paginate via
-// SearchReadAllMaps so volume isn't a concern.
-func resolveImportIDsToSuspenseLines(db *Database, uid int, importIDs []string) (ids []int, unresolved []string, alreadyReconciled []string, err error) {
+// `unresolved` lists chb ids that had no matching account.bank.
+// statement.line at all — likely not yet pushed to Odoo.
+//
+// Three RPCs total (statement lines, journals, move-lines), all
+// paginated by SearchReadAllMaps.
+func resolveImportIDsToCategorisedLines(db *Database, uid int, importIDs []string) (resolved []chbResolution, unresolved []string, err error) {
 	uidsAny := make([]interface{}, 0, len(importIDs))
 	for _, u := range importIDs {
 		uidsAny = append(uidsAny, u)
@@ -446,40 +501,45 @@ func resolveImportIDsToSuspenseLines(db *Database, uid int, importIDs []string) 
 		"id asc",
 	)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("lookup bank statement lines: %v", err)
-	}
-	foundOpen := map[int]int{}   // move_id → journal_id (statement lines that still need categorising)
-	foundUiidOpen := map[string]bool{}
-	foundUiidReconciled := map[string]bool{}
-	for _, s := range slines {
-		uiid := Str(s["unique_import_id"])
-		if Bool(s["is_reconciled"]) {
-			foundUiidReconciled[uiid] = true
-			continue
-		}
-		foundUiidOpen[uiid] = true
-		foundOpen[FieldID(s["move_id"])] = FieldID(s["journal_id"])
+		return nil, nil, fmt.Errorf("lookup bank statement lines: %v", err)
 	}
 
+	// move_id → (journal_id, is_reconciled, unique_import_id). Built
+	// for every statement that came back, regardless of reconciled
+	// state — we want to surface the current account either way.
+	type moveCtx struct {
+		JournalID       int
+		WasReconciled   bool
+		UniqueImportID  string
+	}
+	moveCtxByID := map[int]moveCtx{}
+	seen := map[string]bool{}
+	for _, s := range slines {
+		uiid := Str(s["unique_import_id"])
+		seen[uiid] = true
+		moveCtxByID[FieldID(s["move_id"])] = moveCtx{
+			JournalID:      FieldID(s["journal_id"]),
+			WasReconciled:  Bool(s["is_reconciled"]),
+			UniqueImportID: uiid,
+		}
+	}
 	for _, u := range importIDs {
-		switch {
-		case foundUiidOpen[u]:
-			// will appear in ids below
-		case foundUiidReconciled[u]:
-			alreadyReconciled = append(alreadyReconciled, u)
-		default:
+		if !seen[u] {
 			unresolved = append(unresolved, u)
 		}
 	}
-	if len(foundOpen) == 0 {
-		return nil, unresolved, alreadyReconciled, nil
+	if len(moveCtxByID) == 0 {
+		return nil, unresolved, nil
 	}
 
-	// Journal → suspense_account_id mapping (one RPC, deduped).
+	// Look up each journal's bank GL (default_account_id). The
+	// "non-bank" filter below uses it to pick the categorised side
+	// regardless of whether that side is the suspense account or a
+	// real income/expense account.
 	journalIDSet := map[int]struct{}{}
-	for _, jid := range foundOpen {
-		if jid > 0 {
-			journalIDSet[jid] = struct{}{}
+	for _, ctx := range moveCtxByID {
+		if ctx.JournalID > 0 {
+			journalIDSet[ctx.JournalID] = struct{}{}
 		}
 	}
 	jidsAny := make([]interface{}, 0, len(journalIDSet))
@@ -488,20 +548,22 @@ func resolveImportIDsToSuspenseLines(db *Database, uid int, importIDs []string) 
 	}
 	journals, err := SearchReadAllMaps(db, uid, "account.journal",
 		[]interface{}{[]interface{}{"id", "in", jidsAny}},
-		[]string{"id", "suspense_account_id"},
+		[]string{"id", "default_account_id"},
 		"id asc",
 	)
 	if err != nil {
-		return nil, unresolved, alreadyReconciled, fmt.Errorf("lookup journals: %v", err)
+		return nil, unresolved, fmt.Errorf("lookup journals: %v", err)
 	}
-	suspenseByJournal := map[int]int{}
+	bankByJournal := map[int]int{}
 	for _, j := range journals {
-		suspenseByJournal[Int(j["id"])] = FieldID(j["suspense_account_id"])
+		bankByJournal[Int(j["id"])] = FieldID(j["default_account_id"])
 	}
 
-	// Pull every line on every candidate move, filter to suspense.
-	movesAny := make([]interface{}, 0, len(foundOpen))
-	for mid := range foundOpen {
+	// Every line on every candidate move; pick the non-bank-side
+	// ones. A single move can produce >1 resolution when the
+	// operator split the statement across multiple accounts.
+	movesAny := make([]interface{}, 0, len(moveCtxByID))
+	for mid := range moveCtxByID {
 		movesAny = append(movesAny, mid)
 	}
 	mlines, err := SearchReadAllMaps(db, uid, "account.move.line",
@@ -510,18 +572,64 @@ func resolveImportIDsToSuspenseLines(db *Database, uid int, importIDs []string) 
 		"id asc",
 	)
 	if err != nil {
-		return nil, unresolved, alreadyReconciled, fmt.Errorf("lookup move-lines: %v", err)
+		return nil, unresolved, fmt.Errorf("lookup move-lines: %v", err)
 	}
 	for _, m := range mlines {
 		mid := FieldID(m["move_id"])
 		accID := FieldID(m["account_id"])
-		jid := foundOpen[mid]
-		susp := suspenseByJournal[jid]
-		if susp > 0 && accID == susp {
-			ids = append(ids, Int(m["id"]))
+		ctx := moveCtxByID[mid]
+		if bank := bankByJournal[ctx.JournalID]; bank > 0 && accID == bank {
+			continue // skip the bank-side line
+		}
+		resolved = append(resolved, chbResolution{
+			UniqueImportID:   ctx.UniqueImportID,
+			MoveLineID:       Int(m["id"]),
+			CurrentAccountID: accID,
+			WasReconciled:    ctx.WasReconciled,
+		})
+	}
+	return resolved, unresolved, nil
+}
+
+// lookupAccountLabels batch-reads account.account names for the
+// given ids. Used to render "currently on 743000 (Miscellaneous
+// operating income)" in skip warnings. Empty / errored → empty map;
+// callers degrade gracefully (just show the id).
+func lookupAccountLabels(db *Database, uid int, ids []int) map[int]string {
+	out := map[int]string{}
+	if len(ids) == 0 {
+		return out
+	}
+	any := make([]interface{}, 0, len(ids))
+	seen := map[int]bool{}
+	for _, id := range ids {
+		if id <= 0 || seen[id] {
+			continue
+		}
+		seen[id] = true
+		any = append(any, id)
+	}
+	rows, err := SearchReadAllMaps(db, uid, "account.account",
+		[]interface{}{[]interface{}{"id", "in", any}},
+		[]string{"id", "code", "name"},
+		"code asc",
+	)
+	if err != nil {
+		return out
+	}
+	for _, r := range rows {
+		code := Str(r["code"])
+		name := Str(r["name"])
+		if code == "" && name == "" {
+			continue
+		}
+		if code == "" {
+			out[Int(r["id"])] = name
+		} else {
+			out[Int(r["id"])] = fmt.Sprintf("%s (%s)", code, name)
 		}
 	}
-	return ids, unresolved, alreadyReconciled, nil
+	return out
 }
 
 // printSkippedImportIDs prints a capped list of uniqueImportIds with
@@ -546,6 +654,65 @@ func printSkippedImportIDs(reason string, ids []string, context map[string]strin
 	}
 	if limit < len(ids) {
 		fmt.Printf("    %s… and %d more%s\n", Fmt.Dim, len(ids)-limit, Fmt.Reset)
+	}
+}
+
+// printSkippedReconciled formats the "already reconciled — currently
+// on X" warning for chb txs the resolver mapped to an already-
+// reconciled statement (no --force). Each row shows the chb context
+// and the account the line is currently booked to, so the operator
+// can see exactly what they'd be overriding.
+func printSkippedReconciled(rs []chbResolution, context map[string]string, acctLabels map[int]string) {
+	if len(rs) == 0 {
+		return
+	}
+	limit := 5
+	if limit > len(rs) {
+		limit = len(rs)
+	}
+	fmt.Printf("  %s⚠ %d already reconciled — pass %s--force%s%s to retarget anyway%s\n",
+		Fmt.Yellow, len(rs), Fmt.Cyan, Fmt.Reset+Fmt.Yellow, "", Fmt.Reset)
+	for i := 0; i < limit; i++ {
+		r := rs[i]
+		ctx := context[r.UniqueImportID]
+		acct := defaultIfEmpty(acctLabels[r.CurrentAccountID], fmt.Sprintf("account #%d", r.CurrentAccountID))
+		switch {
+		case ctx != "":
+			fmt.Printf("    %s· %s → currently on %s%s\n", Fmt.Dim, ctx, acct, Fmt.Reset)
+		default:
+			fmt.Printf("    %s· %s → currently on %s%s\n", Fmt.Dim, r.UniqueImportID, acct, Fmt.Reset)
+		}
+	}
+	if limit < len(rs) {
+		fmt.Printf("    %s… and %d more%s\n", Fmt.Dim, len(rs)-limit, Fmt.Reset)
+	}
+}
+
+// printForcedResolutions notes which already-reconciled chb txs got
+// pulled into the write set because --force was passed. Same shape
+// as printSkippedReconciled but framed as an action, not a skip.
+func printForcedResolutions(rs []chbResolution, context map[string]string, acctLabels map[int]string) {
+	if len(rs) == 0 {
+		return
+	}
+	limit := 5
+	if limit > len(rs) {
+		limit = len(rs)
+	}
+	fmt.Printf("  %s↻ %d already-reconciled line%s pulled in by --force%s\n",
+		Fmt.Cyan, len(rs), pluralS(len(rs)), Fmt.Reset)
+	for i := 0; i < limit; i++ {
+		r := rs[i]
+		ctx := context[r.UniqueImportID]
+		acct := defaultIfEmpty(acctLabels[r.CurrentAccountID], fmt.Sprintf("account #%d", r.CurrentAccountID))
+		if ctx != "" {
+			fmt.Printf("    %s· %s → moving from %s%s\n", Fmt.Dim, ctx, acct, Fmt.Reset)
+		} else {
+			fmt.Printf("    %s· %s → moving from %s%s\n", Fmt.Dim, r.UniqueImportID, acct, Fmt.Reset)
+		}
+	}
+	if limit < len(rs) {
+		fmt.Printf("    %s… and %d more%s\n", Fmt.Dim, len(rs)-limit, Fmt.Reset)
 	}
 }
 
