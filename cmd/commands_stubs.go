@@ -9,14 +9,6 @@ import "fmt"
 // As soon as a real Setup / Switch / Journals / Pull / Push / Sync
 // lands in its own file, remove the corresponding stub here.
 
-func Journals(args []string) error {
-	if HasFlag(args, "--help", "-h", "help") {
-		fmt.Println("odoo journals [--search KW] [--all] — list journals (not yet implemented)")
-		return nil
-	}
-	return fmt.Errorf("`odoo journals` not yet implemented")
-}
-
 func Pull(args []string) error {
 	if HasFlag(args, "--help", "-h", "help") {
 		fmt.Println("odoo pull — refresh cache from Odoo (not yet implemented)")
