@@ -1,0 +1,58 @@
+name: Release
+
+# Fires on any pushed tag matching v* (e.g. v0.0.1, v1.2.3). Builds
+# linux + darwin binaries (amd64 + arm64), tarballs them with the
+# README / LICENSE, and creates a GitHub Release with auto-generated
+# notes. Re-running on the same tag is safe (gh refuses overwrites).
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write  # gh release create needs write access to releases
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so --generate-notes can compute deltas
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Build cross-platform binaries
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            staging="odoo-${VERSION}-${os}-${arch}"
+            mkdir -p "dist/${staging}"
+            GOOS="${os}" GOARCH="${arch}" CGO_ENABLED=0 \
+              go build \
+                -trimpath \
+                -ldflags "-s -w -X main.VERSION=${VERSION}" \
+                -o "dist/${staging}/odoo" .
+            cp LICENSE README.md "dist/${staging}/"
+            tar -czf "dist/${staging}.tar.gz" -C dist "${staging}"
+            rm -rf "dist/${staging}"
+          done
+          (cd dist && sha256sum *.tar.gz > checksums.txt)
+          ls -la dist/
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/*.tar.gz dist/checksums.txt
