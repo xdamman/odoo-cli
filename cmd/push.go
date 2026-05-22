@@ -126,13 +126,13 @@ func applyPending(db *Database, uid int, c PendingChange) error {
 	}
 }
 
-// applyReconcilePending is the stub for the reconcile apply path.
-// The real implementation lands when the reconcile command does;
-// at that point this routes through the same machinery the TUI's
-// `-i` flow uses.
+// applyReconcilePending routes queued reconcile changes through
+// the canonical apply path used by the TUI's `-i` flow. The cached
+// bank line + invoice are looked up by id; the actual Odoo writes
+// (draft → rewrite suspense counterpart → repost → reconcile) live
+// in ReconcileBankLineWithInvoice.
 func applyReconcilePending(db *Database, uid int, p ReconcilePayload) error {
-	return fmt.Errorf("reconcile apply path not yet implemented (statement line #%d → move #%d)",
-		p.StatementLineID, p.InvoiceMoveID)
+	return applyReconcilePendingFromCache(db, uid, p)
 }
 
 func printPendingPreview(c PendingChange, verbose bool) {

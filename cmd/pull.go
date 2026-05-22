@@ -332,6 +332,55 @@ func FetchInvoices(db *Database, uid int, moveTypes ...string) ([]Invoice, error
 	return out, nil
 }
 
+// loadCachedInvoices reads invoices.json or bills.json from
+// cache/<dbname>/. Returns (nil, false) when the file is missing
+// or unparseable.
+func loadCachedInvoices(dbname, name string) (*InvoicesFile, bool) {
+	data, err := os.ReadFile(filepath.Join(CacheDir(dbname), name))
+	if err != nil {
+		return nil, false
+	}
+	var file InvoicesFile
+	if err := json.Unmarshal(data, &file); err != nil {
+		return nil, false
+	}
+	return &file, true
+}
+
+// readPartners loads partners.json from the per-DB cache. Returns
+// nil when the file is missing or unparseable.
+func readPartners(dbname string) *PartnersFile {
+	data, err := os.ReadFile(filepath.Join(CacheDir(dbname), "partners.json"))
+	if err != nil {
+		return nil
+	}
+	var idx PartnersFile
+	if err := json.Unmarshal(data, &idx); err != nil {
+		return nil
+	}
+	if idx.ByID == nil {
+		idx.ByID = map[int]*Partner{}
+	}
+	if idx.ByIBAN == nil {
+		idx.ByIBAN = map[string]int{}
+	}
+	return &idx
+}
+
+// loadJournalLines reads cache/<dbname>/journals/<id>.json. Returns
+// nil when missing.
+func loadJournalLines(dbname string, jid int) *JournalLinesFile {
+	data, err := os.ReadFile(filepath.Join(JournalsCacheDir(dbname), fmt.Sprintf("%d.json", jid)))
+	if err != nil {
+		return nil
+	}
+	var file JournalLinesFile
+	if err := json.Unmarshal(data, &file); err != nil {
+		return nil
+	}
+	return &file
+}
+
 // writeInvoicesFile persists either invoices.json or bills.json.
 func writeInvoicesFile(dbname, name string, items []Invoice) error {
 	if err := EnsureCacheDirs(dbname); err != nil {

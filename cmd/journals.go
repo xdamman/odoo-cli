@@ -41,7 +41,12 @@ type Favorites struct {
 
 // Journals dispatches the `odoo journals …` family.
 func Journals(args []string) error {
-	if HasFlag(args, "--help", "-h", "help") {
+	// `--help` short-circuits at the TOP — but only when no
+	// positional id + verb pair is present. Per-verb help printers
+	// (e.g. `odoo journals 47 reconcile --help`) are reached via
+	// the dispatch below so they print their own contextual help.
+	hasIDPlusVerb := nthPositional(args, 2, "--db") != ""
+	if !hasIDPlusVerb && HasFlag(args, "--help", "-h", "help") {
 		printJournalsHelp()
 		return nil
 	}
@@ -309,15 +314,12 @@ func journalFavoriteToggle(jid int, args []string, add bool) error {
 	return nil
 }
 
-// ── reconcile (placeholder for the big port) ────────────────────
-
+// journalReconcileStub used to defer reconcile to a follow-up
+// commit; it now routes to the canonical implementation. Kept under
+// the old name (referenced from the journals dispatch) to minimise
+// churn — the actual logic lives in journals_reconcile.go.
 func journalReconcileStub(jid int, args []string) error {
-	if HasFlag(args, "--help", "-h", "help") {
-		fmt.Println("odoo journals <id> reconcile [-i] [--yes] — coming in a follow-up commit")
-		return nil
-	}
-	_ = jid
-	return fmt.Errorf("`odoo journals %d reconcile` not yet implemented", jid)
+	return Reconcile(jid, args)
 }
 
 // ── fetch + cache ───────────────────────────────────────────────
