@@ -1,0 +1,23 @@
+# Build artefacts
+odoo
+bin/
+dist/
+*.exe
+
+# Test artefacts
+*.test
+coverage.out
+coverage.html
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+
+# OS detritus
+.DS_Store
+Thumbs.db
+
+# Local override files — never check in credentials by accident
+*.env.local
+.env
