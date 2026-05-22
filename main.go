@@ -37,6 +37,16 @@ func main() {
 		exitOn(cmd.Switch(stripCommand(args, "switch")))
 	case "journals":
 		exitOn(cmd.Journals(stripCommand(args, "journals")))
+	case "accounts":
+		exitOn(cmd.Accounts(stripCommand(args, "accounts")))
+	case "account":
+		exitOn(cmd.ListAccount(stripCommand(args, "account")))
+	case "attach":
+		exitOn(cmd.Attach(stripCommand(args, "attach")))
+	case "assign":
+		exitOn(cmd.Assign(stripCommand(args, "assign")))
+	case "unreconcile":
+		exitOn(cmd.UnreconcileFromStdin(stripCommand(args, "unreconcile")))
 	case "pull":
 		exitOn(cmd.Pull(stripCommand(args, "pull")))
 	case "push":

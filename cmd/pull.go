@@ -121,6 +121,9 @@ func Pull(args []string) error {
 	if err != nil {
 		return err
 	}
+	if verbose {
+		fmt.Printf("  %s↳ uid %d (login %s)%s\n", Fmt.Dim, uid, db.Login, Fmt.Reset)
+	}
 
 	started := time.Now()
 	sync := &LastSyncFile{}
@@ -135,7 +138,20 @@ func Pull(args []string) error {
 		fmt.Fprintf(os.Stderr, "  %s⚠ write journals cache: %v%s\n", Fmt.Yellow, err, Fmt.Reset)
 	}
 	sync.JournalsCount = len(journals)
-	fmt.Printf("  %s✓ %d journals%s\n", Fmt.Green, len(journals), Fmt.Reset)
+	favoritesOnOdoo := 0
+	for _, j := range journals {
+		if j.IsFavorite {
+			favoritesOnOdoo++
+		}
+	}
+	if favoritesOnOdoo > 0 {
+		fmt.Printf("  %s✓ %d journals (%d favorite%s)%s\n", Fmt.Green, len(journals), favoritesOnOdoo, pluralS(favoritesOnOdoo), Fmt.Reset)
+	} else {
+		fmt.Printf("  %s✓ %d journals%s\n", Fmt.Green, len(journals), Fmt.Reset)
+	}
+	if verbose {
+		diagnoseFavorites(db, uid, journals)
+	}
 
 	// 2. Favorite journal lines
 	fav, _ := LoadFavorites(db.Name)
@@ -145,11 +161,19 @@ func Pull(args []string) error {
 			pullSet[j.ID] = true
 		}
 	} else {
+		// Authoritative source: Odoo's per-user dashboard favorites
+		// (now mirrored on cached Journal.IsFavorite). The legacy
+		// local favorites.json is unioned in for backward compat.
+		for _, j := range journals {
+			if j.IsFavorite {
+				pullSet[j.ID] = true
+			}
+		}
 		for _, id := range fav.Journals {
 			pullSet[id] = true
 		}
 	}
-	sync.FavoritesCount = len(fav.Journals)
+	sync.FavoritesCount = len(pullSet)
 	if len(pullSet) == 0 {
 		fmt.Printf("  %s↳ no favorite journals — skip lines (run `odoo journals <id> favorite`)%s\n", Fmt.Dim, Fmt.Reset)
 	} else {

@@ -85,7 +85,24 @@ func Setup(args []string) error {
 	fmt.Printf("\n%s✓ Saved %s (active)%s\n", Fmt.Green, db.Name, Fmt.Reset)
 	fmt.Printf("  %sEnv:%s   %s\n", Fmt.Dim, Fmt.Reset, DatabaseEnvPath(db.Name))
 	fmt.Printf("  %sCache:%s %s\n", Fmt.Dim, Fmt.Reset, CacheDir(db.Name))
-	fmt.Printf("\n  Next: %sodoo pull%s to populate the cache, then %sodoo journals --all%s to browse.\n\n",
+
+	// First-run pull: populate journals (incl. favorites), invoices,
+	// bills, and the partner index so the operator can immediately run
+	// `odoo journals` without a separate command.
+	if HasFlag(args, "--no-pull") {
+		fmt.Printf("\n  Next: %sodoo pull%s to populate the cache, then %sodoo journals%s to browse.\n\n",
+			Fmt.Cyan, Fmt.Reset, Fmt.Cyan, Fmt.Reset)
+		return nil
+	}
+	fmt.Printf("\n%s──────── first pull ────────%s\n", Fmt.Dim, Fmt.Reset)
+	if err := Pull([]string{"--db", db.Name}); err != nil {
+		// A pull failure shouldn't roll back the saved config — the
+		// .env is good, the operator just needs to retry `odoo pull`.
+		fmt.Fprintf(os.Stderr, "\n%s⚠ first pull failed: %v%s\n", Fmt.Yellow, err, Fmt.Reset)
+		fmt.Fprintf(os.Stderr, "  Re-run %sodoo pull%s once the issue is resolved.\n\n", Fmt.Cyan, Fmt.Reset)
+		return nil
+	}
+	fmt.Printf("  Next: %sodoo journals%s to browse, %sodoo journals <id> reconcile -i%s to reconcile.\n\n",
 		Fmt.Cyan, Fmt.Reset, Fmt.Cyan, Fmt.Reset)
 	return nil
 }
@@ -205,12 +222,15 @@ func printSetupHelp() {
   %s--login%s   Email / username
   %s--password%s Plain-text password (avoid in shell history; prefer interactive)
   %s--force%s   Overwrite an existing config with the same --name
+  %s--no-pull%s Skip the automatic first pull after saving
 
 %sBEHAVIOUR%s
   1. Reads the four fields above (interactive or via flags).
   2. Calls common.authenticate against Odoo to verify them.
   3. On success: writes ~/.odoo/databases/<name>.env (0600), creates
      ~/.odoo/cache/<name>/, and sets <name> as the active database.
+  4. Runs %sodoo pull%s to populate the cache (journals incl. favorites,
+     open invoices + bills, partner index). Pass %s--no-pull%s to skip.
 
 `,
 		f.Bold, f.Reset,
@@ -224,6 +244,9 @@ func printSetupHelp() {
 		f.Yellow, f.Reset,
 		f.Yellow, f.Reset,
 		f.Yellow, f.Reset,
+		f.Yellow, f.Reset,
 		f.Bold, f.Reset,
+		f.Cyan, f.Reset,
+		f.Yellow, f.Reset,
 	)
 }

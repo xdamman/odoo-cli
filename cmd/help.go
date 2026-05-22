@@ -22,6 +22,16 @@ func PrintTopHelp() {
   %sjournals%s <id> unfavorite    Remove from favorites
   %sjournals%s <id> reconcile [-i] [--yes]
                               Reconcile unmatched bank lines on a journal
+  %sjournals%s <id> unreconcile --account <code|id> [--yes]
+                              Unlink every reconciliation on a journal+account
+  %saccounts%s move <from> <to> [--yes]
+                              Reassign every move-line from one account to another
+  %saccount%s <code> [--jsonl|--json]
+                              List move-lines on an account (JSONL when piped)
+  %sattach%s <invoice-ref> [--yes]
+                              Pipe JSONL → batch-reconcile lines onto an invoice
+  %sassign%s <to-code> [--yes]    Pipe JSONL → reassign lines to a different account
+  %sunreconcile%s [--yes]         Pipe JSONL → unlink reconciliation pairings
   %spull%s                        Refresh local cache from Odoo (favorites + invoices + bills)
   %spush%s [--yes]                Apply pending local changes to Odoo
   %ssync%s [--yes]                pull + push
@@ -53,6 +63,12 @@ func PrintTopHelp() {
 		f.Bold, f.Reset,
 		f.Cyan, f.Reset, f.Yellow, f.Reset,
 		f.Bold, f.Reset,
+		f.Cyan, f.Reset,
+		f.Cyan, f.Reset,
+		f.Cyan, f.Reset,
+		f.Cyan, f.Reset,
+		f.Cyan, f.Reset,
+		f.Cyan, f.Reset,
 		f.Cyan, f.Reset,
 		f.Cyan, f.Reset,
 		f.Cyan, f.Reset,

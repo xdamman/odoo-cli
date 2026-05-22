@@ -22,6 +22,7 @@ type Journal struct {
 	DefaultAccountID  int     `json:"defaultAccountId,omitempty"`
 	SuspenseAccountID int     `json:"suspenseAccountId,omitempty"`
 	Active            bool    `json:"active"`
+	IsFavorite        bool    `json:"isFavorite,omitempty"`  // mirrors Odoo's per-user account.journal.favorite_user_ids
 	Balance           float64 `json:"balance,omitempty"`     // bank/cash journals: running balance
 	LineCount         int     `json:"lineCount,omitempty"`   // last-known line count
 	Updated           string  `json:"updated,omitempty"`     // RFC3339; when this record was last refreshed
@@ -81,8 +82,10 @@ func journalDetailDispatch(jid int, args []string) error {
 		return journalFavoriteToggle(jid, args, false)
 	case "reconcile":
 		return journalReconcileStub(jid, args)
+	case "unreconcile":
+		return Unreconcile(jid, args)
 	default:
-		return fmt.Errorf("unknown journal verb %q (try: favorite / unfavorite / reconcile)", verb)
+		return fmt.Errorf("unknown journal verb %q (try: favorite / unfavorite / reconcile / unreconcile)", verb)
 	}
 }
 
@@ -107,6 +110,15 @@ func journalsList(args []string) error {
 	favSet := map[int]bool{}
 	for _, id := range fav.Journals {
 		favSet[id] = true
+	}
+	// IsFavorite from the cached Journal record (mirroring Odoo's
+	// favorite_user_ids) takes precedence; the local favorites.json
+	// is unioned in for backward compat until the operator's first
+	// post-upgrade pull lands.
+	for _, j := range journals {
+		if j.IsFavorite {
+			favSet[j.ID] = true
+		}
 	}
 
 	filter := journals
@@ -220,10 +232,15 @@ func journalDetail(jid int, args []string) error {
 
 	fav, _ := LoadFavorites(db.Name)
 	star := ""
-	for _, id := range fav.Journals {
-		if id == jid {
-			star = " ★"
-			break
+	if found.IsFavorite {
+		star = " ★"
+	}
+	if star == "" {
+		for _, id := range fav.Journals {
+			if id == jid {
+				star = " ★"
+				break
+			}
 		}
 	}
 
@@ -274,43 +291,82 @@ func journalFavoriteToggle(jid int, args []string, add bool) error {
 	TouchActive(db.Name)
 	PrintActiveDBBanner(db.Name)
 
-	fav, _ := LoadFavorites(db.Name)
-	had := false
-	for _, id := range fav.Journals {
-		if id == jid {
-			had = true
-			break
-		}
-	}
-	if add && had {
-		fmt.Printf("\n%s● Journal #%d is already a favorite.%s\n\n", Fmt.Dim, jid, Fmt.Reset)
-		return nil
-	}
-	if !add && !had {
-		fmt.Printf("\n%s● Journal #%d wasn't a favorite — nothing to remove.%s\n\n", Fmt.Dim, jid, Fmt.Reset)
-		return nil
-	}
-	if add {
-		fav.Journals = append(fav.Journals, jid)
-		sort.Ints(fav.Journals)
-	} else {
-		out := fav.Journals[:0]
-		for _, id := range fav.Journals {
-			if id != jid {
-				out = append(out, id)
-			}
-		}
-		fav.Journals = out
-	}
-	if err := SaveFavorites(db.Name, fav); err != nil {
+	uid, err := AuthDatabase(db)
+	if err != nil {
 		return err
 	}
+
+	// Write to Odoo first — the cached IsFavorite is a mirror, so
+	// Odoo is the source of truth. Which field to write depends on
+	// the Odoo version: favorite_user_ids (per-user m2m) on 17+,
+	// show_on_dashboard (per-journal bool) on older builds.
+	favField := DetectFavoriteField(db, uid)
+	if favField == "" {
+		return fmt.Errorf("Odoo doesn't expose a favorites field on account.journal (neither favorite_user_ids nor show_on_dashboard) — can't sync this toggle")
+	}
+	var writeVal interface{}
+	switch favField {
+	case "favorite_user_ids":
+		// Many2many ops: [4, uid] adds, [3, uid] removes.
+		op := 4
+		if !add {
+			op = 3
+		}
+		writeVal = []interface{}{[]interface{}{op, uid}}
+	case "show_on_dashboard":
+		writeVal = add
+	}
+	if _, err := Exec(db.URL, db.DB, uid, db.Password,
+		"account.journal", "write",
+		[]interface{}{
+			[]interface{}{jid},
+			map[string]interface{}{favField: writeVal},
+		}, nil); err != nil {
+		return fmt.Errorf("write account.journal #%d %s: %v", jid, favField, err)
+	}
+	if favField == "show_on_dashboard" {
+		fmt.Printf("  %s↳ wrote show_on_dashboard=%v (this Odoo build has no per-user favorite — change is visible to every user)%s\n",
+			Fmt.Dim, add, Fmt.Reset)
+	}
+
+	// Patch the cached Journal record so the next `odoo journals`
+	// reflects the new state without requiring a full `pull`.
+	if file, ok := readJournalsCache(db.Name); ok {
+		patched := false
+		for i := range file.Journals {
+			if file.Journals[i].ID == jid {
+				file.Journals[i].IsFavorite = add
+				patched = true
+				break
+			}
+		}
+		if patched {
+			_ = WriteJournalsCache(db.Name, file.Journals)
+		}
+	}
+
+	// Clean any leftover entry from the legacy local favorites file
+	// so the two systems can't drift. Adding via this path is no
+	// longer needed (cached IsFavorite is authoritative), but we
+	// keep the file alive in case a pre-upgrade install populated it.
+	fav, _ := LoadFavorites(db.Name)
+	out := fav.Journals[:0]
+	for _, id := range fav.Journals {
+		if id != jid {
+			out = append(out, id)
+		}
+	}
+	if len(out) != len(fav.Journals) {
+		fav.Journals = out
+		_ = SaveFavorites(db.Name, fav)
+	}
+
 	verb := "added to"
 	if !add {
 		verb = "removed from"
 	}
-	fmt.Printf("\n%s✓ Journal #%d %s favorites (%d total)%s\n\n",
-		Fmt.Green, jid, verb, len(fav.Journals), Fmt.Reset)
+	fmt.Printf("\n%s✓ Journal #%d %s favorites on %s%s\n\n",
+		Fmt.Green, jid, verb, db.Host(), Fmt.Reset)
 	return nil
 }
 
@@ -349,19 +405,37 @@ func loadOrFetchJournals(db *Database) (journals []Journal, fromCache bool, err 
 }
 
 // FetchJournals reads every account.journal from Odoo, returning
-// the slim Journal shape this CLI cares about.
+// the slim Journal shape this CLI cares about. IsFavorite mirrors
+// whichever favorite mechanism the Odoo version exposes:
+//
+//   - Odoo 17+ : account.journal.favorite_user_ids (per-user m2m)
+//   - Odoo ≤16: account.journal.show_on_dashboard  (per-journal bool)
+//
+// Detection happens once at the top via DetectFavoriteField; the
+// chosen field is also what `odoo journals <id> favorite/unfavorite`
+// writes to.
 func FetchJournals(db *Database, uid int) ([]Journal, error) {
+	favField := DetectFavoriteField(db, uid)
+	fields := []string{"id", "name", "code", "type", "currency_id",
+		"default_account_id", "suspense_account_id", "active"}
+	if favField != "" {
+		fields = append(fields, favField)
+	}
 	rows, err := SearchReadAllMaps(db, uid, "account.journal",
-		[]interface{}{},
-		[]string{"id", "name", "code", "type", "currency_id", "default_account_id", "suspense_account_id", "active"},
-		"name asc",
-	)
+		[]interface{}{}, fields, "name asc")
 	if err != nil {
 		return nil, err
 	}
 	out := make([]Journal, 0, len(rows))
 	now := time.Now().UTC().Format(time.RFC3339)
 	for _, r := range rows {
+		isFav := false
+		switch favField {
+		case "favorite_user_ids":
+			isFav = isFavoriteForUID(r["favorite_user_ids"], uid)
+		case "show_on_dashboard":
+			isFav = Bool(r["show_on_dashboard"])
+		}
 		out = append(out, Journal{
 			ID:                Int(r["id"]),
 			Name:              Str(r["name"]),
@@ -371,10 +445,100 @@ func FetchJournals(db *Database, uid int) ([]Journal, error) {
 			DefaultAccountID:  FieldID(r["default_account_id"]),
 			SuspenseAccountID: FieldID(r["suspense_account_id"]),
 			Active:            Bool(r["active"]),
+			IsFavorite:        isFav,
 			Updated:           now,
 		})
 	}
 	return out, nil
+}
+
+// DetectFavoriteField returns the name of the field this Odoo
+// instance uses to model "favorite" journals. Calls fields_get once
+// (cheap) and prefers favorite_user_ids over show_on_dashboard when
+// both exist, since favorite_user_ids is per-user (more accurate).
+// Returns "" when neither field exists — caller treats every journal
+// as non-favorite.
+func DetectFavoriteField(db *Database, uid int) string {
+	raw, err := Exec(db.URL, db.DB, uid, db.Password,
+		"account.journal", "fields_get",
+		[]interface{}{[]interface{}{"favorite_user_ids", "show_on_dashboard"}},
+		map[string]interface{}{"attributes": []interface{}{"type"}})
+	if err != nil {
+		return ""
+	}
+	var result map[string]interface{}
+	if jerr := json.Unmarshal(raw, &result); jerr != nil {
+		return ""
+	}
+	if _, ok := result["favorite_user_ids"]; ok {
+		return "favorite_user_ids"
+	}
+	if _, ok := result["show_on_dashboard"]; ok {
+		return "show_on_dashboard"
+	}
+	return ""
+}
+
+// isFavoriteForUID reports whether uid appears in the many2many
+// favorite_user_ids array returned by search_read.
+func isFavoriteForUID(v interface{}, uid int) bool {
+	arr, ok := v.([]interface{})
+	if !ok {
+		return false
+	}
+	for _, x := range arr {
+		if Int(x) == uid {
+			return true
+		}
+	}
+	return false
+}
+
+// diagnoseFavorites prints, per journal, whichever favorite field
+// Odoo exposes on this instance. Used by `odoo pull -v` to debug
+// situations where the operator has favorites starred on the Odoo
+// dashboard but the CLI doesn't see them.
+func diagnoseFavorites(db *Database, uid int, cached []Journal) {
+	favField := DetectFavoriteField(db, uid)
+	fmt.Printf("    %s── favorites diagnostic (uid=%d, field=%s) ──%s\n",
+		Fmt.Dim, uid, defaultIfEmpty(favField, "<none>"), Fmt.Reset)
+	if favField == "" {
+		fmt.Fprintf(os.Stderr, "    %s⚠ Odoo exposes neither favorite_user_ids nor show_on_dashboard on account.journal — no favorites can sync.%s\n",
+			Fmt.Yellow, Fmt.Reset)
+		return
+	}
+	rows, err := SearchReadAllMaps(db, uid, "account.journal",
+		[]interface{}{},
+		[]string{"id", "name", "code", favField},
+		"name asc",
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "    %s⚠ favorites diagnostic failed: %v%s\n", Fmt.Yellow, err, Fmt.Reset)
+		return
+	}
+	favCount := 0
+	for _, r := range rows {
+		fav := false
+		switch favField {
+		case "favorite_user_ids":
+			fav = isFavoriteForUID(r[favField], uid)
+		case "show_on_dashboard":
+			fav = Bool(r[favField])
+		}
+		if fav {
+			favCount++
+		}
+		marker := " "
+		if fav {
+			marker = "★"
+		}
+		fmt.Printf("    %s%s #%-4d %-32s %s=%v%s\n",
+			Fmt.Dim, marker, Int(r["id"]), Truncate(Str(r["name"]), 32),
+			favField, r[favField], Fmt.Reset)
+	}
+	fmt.Printf("    %ssummary: %d journals flagged via %s%s\n",
+		Fmt.Dim, favCount, favField, Fmt.Reset)
+	_ = cached
 }
 
 // WriteJournalsCache persists the journal list under
@@ -571,6 +735,8 @@ func printJournalsHelp() {
   %sodoo journals%s <id> unfavorite       Remove from favorites
   %sodoo journals%s <id> reconcile [-i] [--yes]
                                      Reconcile unmatched bank lines (TUI with -i)
+  %sodoo journals%s <id> unreconcile --account <code|id> [--yes]
+                                     Unlink every reconciliation on a journal+account
 
 %sBEHAVIOUR%s
   Reads from ~/.odoo/cache/<dbname>/journals/list.json when present;
@@ -582,6 +748,7 @@ func printJournalsHelp() {
 `,
 		f.Bold, f.Reset,
 		f.Bold, f.Reset,
+		f.Cyan, f.Reset,
 		f.Cyan, f.Reset,
 		f.Cyan, f.Reset,
 		f.Cyan, f.Reset,

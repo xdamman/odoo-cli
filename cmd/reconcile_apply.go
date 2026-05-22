@@ -103,6 +103,113 @@ func ReconcileBankLineWithInvoice(db *Database, uid int, line JournalLine, invoi
 	return nil
 }
 
+// AttachLinesToInvoice reconciles N statement lines against ONE
+// invoice/bill in a single Odoo reconcile call. Used by `odoo
+// attach <ref>` when several piped txs collectively settle the
+// invoice (e.g. a partial-payment series).
+//
+// The flow is the multi-line generalisation of
+// ReconcileBankLineWithInvoice:
+//
+//  1. Resolve the invoice's A/R/A/P line + account ONCE. Already-
+//     paid invoices fall back to unreconcileInvoiceAR so the same
+//     "pick a paid candidate ⇒ unreconcile + reattach" rule applies.
+//  2. For each statement line: find its suspense counterpart on
+//     the bank move, then draft → rewrite counterpart's account_id
+//     to the A/R/A/P account → repost.
+//  3. Call account.move.line.reconcile ONCE with [arLine,
+//     counterpart1, counterpart2, …]. All are now on the same
+//     account so Odoo accepts the multi-line reconcile.
+//
+// On failure mid-flight (step 2 errors on the Nth line), every
+// already-rewritten counterpart is left on the A/R/A/P account but
+// not reconciled. Re-running with the same input is safe — step 1
+// will fall through unreconcileInvoiceAR if it has already partially
+// paid, and step 2 is idempotent (writing the same account_id is a
+// no-op on Odoo's side).
+func AttachLinesToInvoice(db *Database, uid int, lines []JournalLine, invoice Invoice) error {
+	if len(lines) == 0 {
+		return fmt.Errorf("no statement lines to attach")
+	}
+	for _, ln := range lines {
+		if ln.MoveID == 0 {
+			return fmt.Errorf("statement line #%d has no move id", ln.ID)
+		}
+	}
+
+	// 1. Resolve A/R line + account on the invoice (once).
+	arLineID, arAccountID, arErr := findOpenReceivablePayableLine(db, uid, invoice.ID)
+	if arErr != nil {
+		if relineID, reaccID, unreconciled, uerr := unreconcileInvoiceAR(db, uid, invoice.ID); uerr == nil && relineID > 0 {
+			fmt.Printf("  %s↻ unreconciled %d existing match%s on %s #%d before re-attaching%s\n",
+				Fmt.Yellow, unreconciled, pluralS(unreconciled), invoice.MoveType, invoice.ID, Fmt.Reset)
+			arLineID = relineID
+			arAccountID = reaccID
+		} else {
+			return fmt.Errorf("invoice #%d: %v", invoice.ID, arErr)
+		}
+	}
+
+	// 2. Per line: find counterpart, draft → write → repost.
+	counterparts := make([]int, 0, len(lines))
+	for _, line := range lines {
+		counterpartID, err := findStatementCounterpartLine(db, uid, line)
+		if err != nil {
+			return fmt.Errorf("find counterpart on move #%d: %v", line.MoveID, err)
+		}
+		if counterpartID == 0 {
+			return fmt.Errorf("could not identify the suspense counterpart on move #%d", line.MoveID)
+		}
+		if err := withMoveTemporarilyDraft(db, uid, line.MoveID, func() error {
+			_, werr := Exec(db.URL, db.DB, uid, db.Password,
+				"account.move.line", "write",
+				[]interface{}{[]interface{}{counterpartID}, map[string]interface{}{"account_id": arAccountID}}, nil)
+			if werr != nil {
+				return fmt.Errorf("rewrite counterpart line #%d: %v", counterpartID, werr)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		counterparts = append(counterparts, counterpartID)
+	}
+
+	// 3. Single reconcile call covering A/R + every counterpart.
+	all := make([]interface{}, 0, len(counterparts)+1)
+	all = append(all, arLineID)
+	for _, id := range counterparts {
+		all = append(all, id)
+	}
+	if _, err := Exec(db.URL, db.DB, uid, db.Password,
+		"account.move.line", "reconcile",
+		[]interface{}{all}, nil); err != nil {
+		return fmt.Errorf("reconcile %d lines against A/R #%d: %v", len(counterparts), arLineID, err)
+	}
+
+	// 4. Best-effort partner attribution on each bank line + cache patch.
+	for _, line := range lines {
+		if invoice.PartnerID > 0 && line.PartnerID == 0 {
+			_, _ = Exec(db.URL, db.DB, uid, db.Password,
+				"account.bank.statement.line", "write",
+				[]interface{}{[]interface{}{line.ID}, map[string]interface{}{"partner_id": invoice.PartnerID}}, nil)
+		}
+		if f := loadJournalLines(db.Name, line.JournalID); f != nil {
+			patched := false
+			for i := range f.Lines {
+				if f.Lines[i].ID == line.ID {
+					f.Lines[i].IsReconciled = true
+					patched = true
+					break
+				}
+			}
+			if patched {
+				_ = WriteJournalLines(db.Name, line.JournalID, f.Lines)
+			}
+		}
+	}
+	return nil
+}
+
 // findOpenReceivablePayableLine returns the (lineID, accountID) of
 // the invoice's still-unreconciled A/R or A/P line. Filtered by
 // account_type (more reliable than the per-account reconcile flag,
